@@ -5,8 +5,7 @@
 
     RewriteEngine On
 
-    # Redirect SOLO la home del dominio principale a /login
-    RewriteCond %{HTTP_HOST} ^(www\.)?hostand\.eu$ [NC]
+    # Redirect della home a /login (qualsiasi dominio: hostand.eu, minialberghi.it, ...)
     RewriteCond %{REQUEST_URI} ^/$
     RewriteRule ^$ /login [R=302,L]
 
