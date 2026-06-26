@@ -1,0 +1,13 @@
+---
+deployment:
+  tasks:
+    - export APPPATH=/home/hostand/app_hostand
+    - export WEBPATH=/home/hostand/public_html
+    # 1) Codice applicativo, FUORI dalla web root. Preserva .env e storage del server.
+    - /usr/bin/rsync -a --exclude='.git' --exclude='.env' --exclude='.env.*' --exclude='storage/' ./app_hostand/ $APPPATH/
+    # 2) Web root (= contenuto di public/). Preserva uploads e il symlink storage esistenti.
+    - /usr/bin/rsync -a --exclude='uploads' --exclude='upload' --exclude='assets/images' --exclude='storage' ./public_html/ $WEBPATH/
+    # 3) Symlink di storage (disco 'public', servito da /storage/). Idempotente.
+    - /bin/ln -sfn $APPPATH/storage/app/public $WEBPATH/storage
+    # 4) Svuota la cache di config (evita percorsi vecchi in cache)
+    - /bin/rm -f $APPPATH/bootstrap/cache/config.php $APPPATH/bootstrap/cache/routes-v7.php

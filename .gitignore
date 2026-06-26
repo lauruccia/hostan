@@ -1,0 +1,38 @@
+# ===== Solo locale: dati, screenshot, report (NON versionare) =====
+/Database
+/*.png
+/REPORT_SICUREZZA_hostand.md
+
+# ===== Dipendenze =====
+/app_hostand/node_modules
+# NB: app_hostand/vendor NON è ignorato: il server non ha Composer, va deployato.
+
+# ===== Segreti (mai su GitHub) =====
+/app_hostand/.env
+/app_hostand/.env.*
+!/app_hostand/.env.example
+
+# ===== Runtime applicazione (resta sul server) =====
+/app_hostand/storage/app/*
+!/app_hostand/storage/app/.gitignore
+/app_hostand/storage/framework/cache/*
+/app_hostand/storage/framework/sessions/*
+/app_hostand/storage/framework/views/*
+/app_hostand/storage/logs/*
+/app_hostand/storage/upload/*
+/app_hostand/storage/public/*
+/app_hostand/error_log
+/app_hostand/error_log_php
+
+# ===== Dati utente nella web root (restano sul server) =====
+/public_html/uploads
+/public_html/upload
+/public_html/assets/images
+/public_html/storage
+
+# ===== Backup / rumore / residui =====
+*.old
+*.bak
+*~
+.DS_Store
+Thumbs.db

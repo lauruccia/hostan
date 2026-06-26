@@ -1,0 +1,614 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\MaintenanceRequest;
+use App\Models\User;
+use App\Models\Property;
+use App\Models\PropertyUnit;
+use App\Models\Type;
+use Illuminate\Http\Request;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
+use Barryvdh\DomPDF\Facade\Pdf;
+
+class AdminServiceAssignmentController extends Controller
+{
+    public function __construct()
+    {
+        $this->middleware('auth');
+        $this->middleware(function ($request, $next) {
+            if (!in_array(Auth::user()->type, ['super admin', 'admin'])) {
+                return redirect()->back()->with('error', __('Access Denied! Admin access required.'));
+            }
+            return $next($request);
+        });
+    }
+
+    public function index(Request $request)
+    {
+        $today = Carbon::today();
+
+        // From-date filter: default to today so list shows "closest first" from today (not old test data)
+        $fromDate = $request->get('from_date', $today->format('Y-m-d'));
+        $fromCarbon = Carbon::parse($fromDate)->startOfDay();
+
+        // Get all maintenance requests sorted by closest arrival_time first (ASC)
+        $allRequests = MaintenanceRequest::with(['properties', 'units', 'types', 'maintainers', 'rider'])
+            ->orderByRaw('CASE WHEN arrival_time IS NULL THEN 1 ELSE 0 END ASC')
+            ->orderBy('arrival_time', 'asc')
+            ->get();
+
+        // Apply from_date filter: only show requests from this date onward (or with no date)
+        $allRequests = $allRequests->filter(function ($req) use ($fromCarbon) {
+            if (!$req->arrival_time) {
+                return true; // keep "no date" requests
+            }
+            return Carbon::parse($req->arrival_time)->startOfDay()->gte($fromCarbon);
+        });
+
+        // Filter pending requests (unassigned or maintainer_id = 0)
+        $pendingRequests = $allRequests->filter(function($request) {
+            return $request->status === 'pending' &&
+                   ($request->maintainer_id == 0 || $request->maintainer_id == null);
+        });
+
+        // Get all maintainers (operators) with their types
+        $maintainers = User::where('type', 'maintainer')
+            ->with(['maintainer.types'])
+            ->orderBy('first_name', 'asc')
+            ->get();
+
+        // Get service types
+        $serviceTypes = Type::where('type', 'issue')
+            ->orderBy('title', 'asc')
+            ->get();
+
+        // Group pending requests by request_date (for legacy use)
+        $requestsByDate = $pendingRequests->groupBy(function ($request) {
+            return Carbon::parse($request->request_date)->format('Y-m-d');
+        });
+
+        // Group ALL requests by arrival_time date for operational day-grouped view
+        $allRequestsByDate = $allRequests->groupBy(function ($request) {
+            if ($request->arrival_time) {
+                return Carbon::parse($request->arrival_time)->format('Y-m-d');
+            }
+            return 'no-date';
+        })->sortKeysUsing(function ($a, $b) {
+            if ($a === 'no-date') return 1;
+            if ($b === 'no-date') return -1;
+            return strcmp($a, $b);
+        });
+
+        // Get today's assigned services (by scheduled arrival time)
+        // Include pending (assigned but not started yet) and in_progress.
+        $todayAssigned = MaintenanceRequest::whereIn('status', ['pending', 'in_progress'])
+            ->whereNotNull('arrival_time')
+            ->whereDate('arrival_time', $today)
+            ->with(['properties', 'units', 'types', 'maintainers', 'rider'])
+            ->get();
+
+        // Get tomorrow's assigned services (by scheduled arrival time)
+        // Include pending (assigned but not started yet) and in_progress.
+        $tomorrowAssigned = MaintenanceRequest::whereIn('status', ['pending', 'in_progress'])
+            ->whereNotNull('arrival_time')
+            ->whereDate('arrival_time', $today->copy()->addDay())
+            ->with(['properties', 'units', 'types', 'maintainers', 'rider'])
+            ->get();
+
+        return view('admin.service-assignment.index', compact(
+            'allRequests',
+            'allRequestsByDate',
+            'pendingRequests',
+            'maintainers',
+            'serviceTypes',
+            'requestsByDate',
+            'todayAssigned',
+            'tomorrowAssigned',
+            'today',
+            'fromDate'
+        ));
+    }
+
+    public function assignService(Request $request)
+    {
+        $request->validate([
+            'maintenance_request_id' => 'required|exists:maintenance_requests,id',
+            'maintainer_id' => 'required|exists:users,id',
+            'assigned_date' => 'required|date',
+            'notes' => 'nullable|string|max:500',
+            'rider_id' => 'nullable|exists:users,id'
+        ]);
+
+        $maintenanceRequest = MaintenanceRequest::findOrFail($request->maintenance_request_id);
+        $maintainer = User::findOrFail($request->maintainer_id);
+
+        // Check if maintainer is available on the assigned date
+        $existingAssignments = MaintenanceRequest::where('maintainer_id', $request->maintainer_id)
+            ->whereDate('arrival_time', Carbon::parse($request->assigned_date)->format('Y-m-d'))
+            ->whereIn('status', ['pending', 'in_progress'])
+            ->count();
+
+        if ($existingAssignments >= 50) { // Limit to 50 services per day per maintainer
+            return redirect()->back()->with('error', __('Maintainer already has maximum assignments for this date.'));
+        }
+
+        // ✅ Get the configured timezone from settings
+        $settings = settings();
+        $timezone = !empty($settings['timezone']) && $settings['timezone'] !== '' ? $settings['timezone'] : 'UTC';
+        
+        // ✅ Convert assigned_date to UTC for storage
+        $arrivalTime = Carbon::parse($request->assigned_date, $timezone)
+            ->setTimezone('UTC')
+            ->format('Y-m-d H:i:s');
+
+        $updateData = [
+            'maintainer_id' => $request->maintainer_id,
+            'arrival_time' => $arrivalTime,
+            'admin_notes' => $request->notes,
+            'assigned_at' => now(),
+            'assigned_by' => Auth::id(),
+            'status' => 'pending'
+        ];
+        $updateData['rider_id'] = !empty($request->rider_id) ? $request->rider_id : 0;
+
+        $maintenanceRequest->update($updateData);
+
+        return redirect()->back()->with('success', __('Service assigned successfully to') . ' ' . $maintainer->name);
+    }
+
+    public function reassignService(Request $request)
+    {
+        $request->validate([
+            'maintenance_request_id' => 'required|exists:maintenance_requests,id',
+            'new_maintainer_id' => 'required|exists:users,id',
+            'new_date' => 'required|date',
+            'notes' => 'nullable|string|max:500',
+            'rider_id' => 'nullable|exists:users,id'
+        ]);
+
+        $maintenanceRequest = MaintenanceRequest::findOrFail($request->maintenance_request_id);
+        $newMaintainer = User::findOrFail($request->new_maintainer_id);
+
+        // Check if new maintainer is available
+        $existingAssignments = MaintenanceRequest::where('maintainer_id', $request->new_maintainer_id)
+            ->whereDate('arrival_time', Carbon::parse($request->new_date)->format('Y-m-d'))
+            ->whereIn('status', ['pending', 'in_progress'])
+            ->count();
+            
+            //Nr massimo riassegnazioni - commentato 15 05 per togliere il limite
+
+      //  if ($existingAssignments >= 5) {
+        //    return redirect()->back()->with('error', __('New maintainer // already has maximum assignments for this date.'));
+        // }
+
+        // ✅ Get the configured timezone from settings
+        $settings = settings();
+        $timezone = !empty($settings['timezone']) && $settings['timezone'] !== '' ? $settings['timezone'] : 'UTC';
+        
+        // ✅ Convert new_date to UTC for storage
+        $arrivalTime = Carbon::parse($request->new_date, $timezone)
+            ->setTimezone('UTC')
+            ->format('Y-m-d H:i:s');
+
+        $updateData = [
+            'maintainer_id' => $request->new_maintainer_id,
+            'arrival_time' => $arrivalTime,
+            'admin_notes' => $request->notes,
+            'reassigned_at' => now(),
+            'reassigned_by' => Auth::id(),
+            'status' => 'pending'
+        ];
+        $updateData['rider_id'] = !empty($request->rider_id) ? $request->rider_id : 0;
+
+        $maintenanceRequest->update($updateData);
+
+        return redirect()->back()->with('success', __('Service reassigned successfully to') . ' ' . $newMaintainer->name);
+    }
+
+    public function unassignService(Request $request)
+    {
+        $request->validate([
+            'maintenance_request_id' => 'required|exists:maintenance_requests,id'
+        ]);
+
+        $maintenanceRequest = MaintenanceRequest::findOrFail($request->maintenance_request_id);
+
+        $maintenanceRequest->update([
+            'maintainer_id' => 0,
+            'rider_id' => 0,
+            'status' => 'pending',
+            'admin_notes' => 'Unassigned by admin',
+            'unassigned_at' => now(),
+            'unassigned_by' => Auth::id()
+        ]);
+
+        return redirect()->back()->with('success', __('Service unassigned successfully.'));
+    }
+
+public function maintainerSchedule($maintainerId = null)
+{
+    if ($maintainerId) {
+        // Individual maintainer schedule view
+        $maintainer = User::where('type', 'maintainer')
+            ->where('id', $maintainerId)
+            ->firstOrFail();
+
+        $today = Carbon::today();
+        $weekStart = $today->copy()->startOfWeek();
+        $weekEnd = $today->copy()->endOfWeek();
+
+        // Get maintainer's schedule for the week
+        $weeklySchedule = MaintenanceRequest::where('maintainer_id', $maintainerId)
+            ->whereIn('status', ['pending', 'in_progress', 'completed'])
+            ->with(['properties', 'units', 'types'])
+            ->orderBy('request_date', 'asc')
+            ->get();
+
+        // ✅ Normalize locale (fixes "italian" vs "it")
+        $locale = app()->getLocale();
+        if ($locale === 'italian') {
+            $locale = 'it';
+        }
+
+        // ✅ Apply Carbon and system locale
+        \Carbon\Carbon::setLocale($locale);
+        setlocale(LC_TIME, $locale . '_' . strtoupper($locale) . '.UTF-8');
+
+        // Group by day
+        $scheduleByDay = [];
+        for ($i = 0; $i < 7; $i++) {
+            $date = $weekStart->copy()->addDays($i);
+            $dayServices = $weeklySchedule->filter(function ($service) use ($date) {
+                return Carbon::parse($service->request_date)->isSameDay($date);
+            });
+
+            $scheduleByDay[$date->format('Y-m-d')] = [
+                'date' => $date->locale($locale),
+                'services' => $dayServices,
+                'count' => $dayServices->count(),
+            ];
+        }
+
+        return view('admin.service-assignment.maintainer-schedule', compact(
+            'maintainer',
+            'scheduleByDay',
+            'weeklySchedule'
+        ));
+    }
+
+    // ----------------------------
+    // Overview of all maintainers
+    // ----------------------------
+    else {
+        // dd('here');
+        $maintainers = User::where('type', 'maintainer')
+            ->orderBy('first_name', 'asc')
+            ->get();
+
+        $today = Carbon::today();
+        $weekStart = $today->copy()->startOfWeek();
+        $weekEnd = $today->copy()->endOfWeek();
+
+        // Get all assignments for the week (including pending, in_progress, and completed)
+        $weeklyAssignments = MaintenanceRequest::whereIn('status', ['pending', 'in_progress', 'completed'])
+            ->whereNotNull('maintainer_id')
+            ->where('maintainer_id', '!=', 0)
+            ->with(['properties', 'units', 'types', 'maintainers'])
+            ->get();
+
+        $maintainerSchedules = [];
+        foreach ($maintainers as $maintainer) {
+            $maintainerServices = $weeklyAssignments->where('maintainer_id', $maintainer->id);
+
+            $scheduleByDay = [];
+            for ($i = 0; $i < 7; $i++) {
+                $date = $weekStart->copy()->addDays($i);
+                $dayServices = $maintainerServices->filter(function ($service) use ($date) {
+                    return Carbon::parse($service->arrival_time)->isSameDay($date);
+                });
+
+                $scheduleByDay[$date->format('Y-m-d')] = [
+                    'date' => $date,
+                    'services' => $dayServices,
+                    'count' => $dayServices->count(),
+                ];
+            }
+
+            $maintainerSchedules[$maintainer->id] = [
+                'maintainer' => $maintainer,
+                'scheduleByDay' => $scheduleByDay,
+                'totalServices' => $maintainerServices->count(),
+            ];
+        }
+
+        return view('admin.service-assignment.operator-schedules', compact(
+            'maintainers',
+            'maintainerSchedules',
+            'weekStart',
+            'weekEnd'
+        ));
+    }
+}
+
+
+
+
+
+    public function bulkAssign(Request $request)
+    {
+        $request->validate([
+            'service_ids' => 'required|array',
+            'service_ids.*' => 'exists:maintenance_requests,id',
+            'maintainer_id' => 'required|exists:users,id',
+            'assigned_date' => 'required|date',
+            'notes' => 'nullable|string|max:500',
+            'rider_id' => 'nullable|exists:users,id'
+        ]);
+
+        $maintainer = User::findOrFail($request->maintainer_id);
+        $assignedCount = 0;
+        $riderId = !empty($request->rider_id) ? $request->rider_id : 0;
+
+        foreach ($request->service_ids as $serviceId) {
+            $maintenanceRequest = MaintenanceRequest::find($serviceId);
+            
+            if ($maintenanceRequest && 
+               ($maintenanceRequest->status === 'pending' || $maintenanceRequest->status === 'in_progress')) {
+                // Check maintainer availability (by scheduled date)
+                $assignDate = $request->assigned_date;
+                $existingAssignments = MaintenanceRequest::where('maintainer_id', $request->maintainer_id)
+                    ->whereDate('arrival_time', Carbon::parse($assignDate)->format('Y-m-d'))
+                    ->whereIn('status', ['pending', 'in_progress'])
+                    ->count();
+
+                if ($existingAssignments < 5) {
+                    $settings = settings();
+                    $timezone = !empty($settings['timezone']) && $settings['timezone'] !== '' ? $settings['timezone'] : 'UTC';
+                    $arrivalTime = Carbon::parse($assignDate . ' 09:00:00', $timezone)->setTimezone('UTC')->format('Y-m-d H:i:s');
+
+                    $maintenanceRequest->update([
+                        'maintainer_id' => $request->maintainer_id,
+                        'rider_id' => $riderId,
+                        'arrival_time' => $arrivalTime,
+                        // Keep pending until maintainer starts the service
+                        'status' => 'pending',
+                        'admin_notes' => $request->notes,
+                        'assigned_at' => now(),
+                        'assigned_by' => Auth::id()
+                    ]);
+                    $assignedCount++;
+                }
+            }
+        }
+
+        return redirect()->back()->with('success', __('Successfully assigned') . ' ' . $assignedCount . ' ' . __('services to') . ' ' . $maintainer->name);
+    }
+
+    public function getMaintainerAvailability(Request $request)
+    {
+        $request->validate([
+            'maintainer_id' => 'required|exists:users,id',
+            'date' => 'required|date'
+        ]);
+
+        $assignments = MaintenanceRequest::where('maintainer_id', $request->maintainer_id)
+            ->whereDate('arrival_time', Carbon::parse($request->date)->format('Y-m-d'))
+            ->whereIn('status', ['pending', 'in_progress'])
+            ->with(['properties', 'units', 'types'])
+            ->get();
+
+        return response()->json([
+            'assignments' => $assignments,
+            'count' => $assignments->count(),
+            'available' => $assignments->count() < 5
+        ]);
+    }
+
+    public function getCompatibleMaintainers(Request $request)
+    {
+        $request->validate([
+            'service_type_id' => 'required|exists:types,id'
+        ]);
+
+        // For now, get all maintainers since the type matching might not be set up correctly
+        // TODO: Implement proper service type to maintainer type mapping
+        $compatibleMaintainers = User::where('type', 'maintainer')
+            ->with(['maintainer.types'])
+            ->orderBy('first_name', 'asc')
+            ->get();
+
+        return response()->json([
+            'maintainers' => $compatibleMaintainers->map(function($maintainer) {
+                return [
+                    'id' => $maintainer->id,
+                    'name' => $maintainer->name,
+                    'type' => $maintainer->maintainer->types->title ?? 'General'
+                ];
+            })
+        ]);
+    }
+
+    /**
+     * View operator reports (admin can view any operator's reports)
+     */
+    public function operatorReports(Request $request)
+    {
+        $data = $this->prepareOperatorReportData($request);
+        
+        if (isset($data['error'])) {
+            return view('admin.service-assignment.operator-reports', [
+                'allOperators' => $data['allOperators'],
+                'operator' => null,
+                'today' => $data['today']
+            ]);
+        }
+
+        return view('admin.service-assignment.operator-reports', $data);
+    }
+
+    /**
+     * Export operator reports to PDF
+     */
+    public function exportOperatorReports(Request $request)
+    {
+        ini_set('memory_limit', '512M');
+        set_time_limit(300);
+
+        $data = $this->prepareOperatorReportData($request);
+
+        if (isset($data['error']) || !$data['operator']) {
+            return redirect()->back()->with('error', __('Could not generate report. Please select a valid operator.'));
+        }
+
+        $pdf = Pdf::loadView('admin.service-assignment.export_operator_reports', $data);
+        
+        $filename = 'operator-report-' . ($data['operator']->first_name ?? 'staff') . '-' . date('Y-m-d') . '.pdf';
+        return $pdf->download($filename);
+    }
+
+    /**
+     * Helper to prepare operator report data for both view and export
+     */
+    private function prepareOperatorReportData(Request $request)
+    {
+        $today = Carbon::today();
+        
+        // Get operator ID from request
+        $operatorId = $request->get('operator_id');
+        
+        // Get all maintainers for dropdown
+        $allOperators = User::where('type', 'maintainer')
+            ->orderBy('first_name', 'asc')
+            ->get();
+        
+        // If no operator selected and operators exist, use first one
+        if (!$operatorId && $allOperators->count() > 0) {
+            $operatorId = $allOperators->first()->id;
+        }
+        
+        // Get selected operator
+        $operator = $operatorId ? User::find($operatorId) : null;
+        
+        // If no operator selected, return essentials
+        if (!$operator || $operator->type !== 'maintainer') {
+            return [
+                'error' => true,
+                'allOperators' => $allOperators,
+                'today' => $today
+            ];
+        }
+        
+        // Get date range from request or default to current month
+        $startDate = $request->get('start_date', $today->copy()->startOfMonth()->format('Y-m-d'));
+        $endDate = $request->get('end_date', $today->copy()->endOfMonth()->format('Y-m-d'));
+        
+        $start = Carbon::parse($startDate)->startOfDay()->setTimezone('UTC');
+        $end = Carbon::parse($endDate)->endOfDay()->setTimezone('UTC');
+
+        // Get all services in date range (operator is main assignee or rider)
+        $allServices = MaintenanceRequest::where(function ($q) use ($operator) {
+            $q->where('maintainer_id', $operator->id)->orWhere('rider_id', $operator->id);
+        })
+            ->whereNotNull('arrival_time')
+            ->whereBetween('arrival_time', [$start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s')])
+            ->with(['properties', 'units', 'types'])
+            ->orderBy('arrival_time', 'desc')
+            ->get();
+
+        // Get ALL services for operator (no date restriction)
+        $allServicesUnfiltered = MaintenanceRequest::where(function ($q) use ($operator) {
+            $q->where('maintainer_id', $operator->id)->orWhere('rider_id', $operator->id);
+        })
+            ->whereNotNull('arrival_time')
+            ->with(['properties', 'units', 'types'])
+            ->orderBy('arrival_time', 'desc')
+            ->get();
+
+        $completedServices = $allServices->where('status', 'completed');
+        $totalServices = $completedServices->count();
+        $totalHours = $completedServices->sum('hours_worked') ?? 0;
+        $totalAmount = $completedServices->sum('amount') ?? 0;
+        
+        $totalAllServices = $allServices->count();
+        $pendingServices = $allServices->where('status', 'pending')->count();
+        $inProgressServices = $allServices->where('status', 'in_progress')->count();
+        
+        $servicesByProperty = $allServices->groupBy('property_id');
+        
+        $servicesByWeek = $allServices->groupBy(function ($service) {
+            if (!empty($service->arrival_time)) {
+                try {
+                    return Carbon::parse($service->arrival_time, 'UTC')->startOfWeek()->format('Y-m-d');
+                } catch (\Exception $e) {
+                    return 'no-date';
+                }
+            }
+            return 'no-date';
+        });
+
+        // Group by day - current selected range
+        $servicesByDay = $allServices->groupBy(function ($service) {
+            if (!empty($service->arrival_time)) {
+                try {
+                    return Carbon::parse($service->arrival_time, 'UTC')->format('Y-m-d');
+                } catch (\Exception $e) {
+                    return 'no-date';
+                }
+            }
+            return 'no-date';
+        });
+
+        $servicesByMonth = $allServices->groupBy(function ($service) {
+            if (!empty($service->arrival_time)) {
+                try {
+                    return Carbon::parse($service->arrival_time, 'UTC')->format('Y-m');
+                } catch (\Exception $e) {
+                    return 'no-date';
+                }
+            }
+            return 'no-date';
+        });
+
+        // Today's services for hourly reports
+        $todayStart = $today->copy()->startOfDay()->setTimezone('UTC');
+        $todayEnd = $today->copy()->endOfDay()->setTimezone('UTC');
+        $todayServicesForHourly = $allServices->filter(function ($service) use ($todayStart, $todayEnd) {
+            if (!empty($service->arrival_time)) {
+                try {
+                    $serviceDate = Carbon::parse($service->arrival_time, 'UTC');
+                    return $serviceDate->between($todayStart, $todayEnd);
+                } catch (\Exception $e) {
+                    return false;
+                }
+            }
+            return false;
+        })->sortByDesc('arrival_time');
+        
+        return [
+            'completedServices' => $completedServices,
+            'allServices' => $allServices,
+            'allServicesUnfiltered' => $allServicesUnfiltered,
+            'totalServices' => $totalServices,
+            'totalHours' => $totalHours,
+            'totalAmount' => $totalAmount,
+            'totalAllServices' => $totalAllServices,
+            'pendingServices' => $pendingServices,
+            'inProgressServices' => $inProgressServices,
+            'servicesByProperty' => $servicesByProperty,
+            'servicesByWeek' => $servicesByWeek,
+            'servicesByDay' => $servicesByDay,
+            'servicesByMonth' => $servicesByMonth,
+            'servicesByHour' => collect(),
+            'todayServicesForHourly' => $todayServicesForHourly,
+            'startDate' => $startDate,
+            'endDate' => $endDate,
+            'operator' => $operator,
+            'allOperators' => $allOperators,
+            'operatorId' => $operatorId,
+            'today' => $today
+        ];
+    }
+}
