@@ -12,17 +12,27 @@
 /app_hostand/.env.*
 !/app_hostand/.env.example
 
-# ===== Runtime applicazione (resta sul server) =====
+# ===== Runtime: mantiene le cartelle (.gitkeep) ma ignora i contenuti =====
 /app_hostand/storage/app/*
-!/app_hostand/storage/app/.gitignore
+!/app_hostand/storage/app/.gitkeep
+!/app_hostand/storage/app/public/
+/app_hostand/storage/app/public/*
+!/app_hostand/storage/app/public/.gitkeep
 /app_hostand/storage/framework/cache/*
+!/app_hostand/storage/framework/cache/.gitkeep
+!/app_hostand/storage/framework/cache/data/
+/app_hostand/storage/framework/cache/data/*
+!/app_hostand/storage/framework/cache/data/.gitkeep
 /app_hostand/storage/framework/sessions/*
+!/app_hostand/storage/framework/sessions/.gitkeep
 /app_hostand/storage/framework/views/*
+!/app_hostand/storage/framework/views/.gitkeep
+/app_hostand/storage/framework/testing
 /app_hostand/storage/logs/*
-/app_hostand/storage/upload/*
-/app_hostand/storage/public/*
-/app_hostand/error_log
-/app_hostand/error_log_php
+!/app_hostand/storage/logs/.gitkeep
+/app_hostand/storage/upload
+/app_hostand/storage/uploads
+/app_hostand/storage/public
 
 # ===== Dati utente nella web root (restano sul server) =====
 /public_html/uploads
